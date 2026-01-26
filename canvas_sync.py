@@ -21,8 +21,8 @@ import asyncio
 import re
 import hashlib
 from pathlib import Path
-from datetime import datetime
-from urllib.parse import urljoin, unquote, urlparse
+from datetime import datetime, date, timedelta, timezone
+from urllib.parse import urljoin, unquote, urlparse, parse_qs
 from html.parser import HTMLParser
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -41,6 +41,95 @@ load_dotenv()
 # Configuration
 CANVAS_URL = "https://canvas.santarosa.edu"
 SESSION_FILE = Path(__file__).parent / ".canvas_session.json"
+ZOOM_LTI_ADVANTAGE_URL = os.getenv("ZOOM_LTI_ADVANTAGE_URL", "https://applications.zoom.us/lti/advantage")
+
+def normalize_url(url: str) -> str:
+    """Normalize a URL from Canvas HTML to an absolute URL when possible."""
+    if not url:
+        return url
+    url = str(url).strip()
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.startswith("/"):
+        return f"{CANVAS_URL}{url}"
+    return url
+
+
+def unwrap_canvas_deep_link(url: str) -> Optional[str]:
+    """Best-effort unwrap of Canvas redirect/launch URLs to their external target.
+
+    Canvas often wraps external resources in URLs like:
+    - /courses/.../external_tools/retrieve?url=<encoded>
+    - /courses/.../external_url?url=<encoded>
+    This tries to extract and decode those embedded targets.
+    """
+    if not url:
+        return None
+
+    # Make absolute so urlparse has host info for relative Canvas links.
+    url_abs = normalize_url(url)
+
+    try:
+        parsed = urlparse(url_abs)
+    except Exception:
+        return None
+
+    host = (parsed.hostname or "").lower()
+    if host and host != urlparse(CANVAS_URL).hostname:
+        # Already external.
+        return None
+
+    qs = parse_qs(parsed.query or "")
+    # Common parameter names used to carry external targets.
+    candidate_params = ["url", "redirect", "redirect_uri", "return_to", "next", "target"]
+    candidates: list[str] = []
+    for k in candidate_params:
+        for v in qs.get(k, []):
+            if v:
+                candidates.append(v)
+
+    def decode_maybe_twice(s: str) -> str:
+        # Canvas links are often percent-encoded once (sometimes nested).
+        s1 = unquote(s)
+        s2 = unquote(s1)
+        return s2
+
+    for cand in candidates:
+        decoded = decode_maybe_twice(cand).strip()
+        if not decoded:
+            continue
+        if decoded.startswith("/"):
+            decoded = f"{CANVAS_URL}{decoded}"
+        if decoded.startswith("http"):
+            try:
+                decoded_host = (urlparse(decoded).hostname or "").lower()
+                if decoded_host and decoded_host != urlparse(CANVAS_URL).hostname:
+                    return decoded
+            except Exception:
+                # If it looks like a URL but parsing fails, still prefer it.
+                return decoded
+    return None
+
+
+def is_zoom_url(url: str) -> bool:
+    """Best-effort detection for direct Zoom domains (join links, LTI, etc.)."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url if "://" in url else f"https://{url.lstrip('/')}")
+        host = (parsed.hostname or "").lower()
+        return host.endswith("zoom.us") or host.endswith("zoomgov.com")
+    except Exception:
+        lower = str(url).lower()
+        return ("zoom.us" in lower) or ("zoomgov.com" in lower)
+
+
+def is_zoom_related(url: str, title: str = "", source_title: str = "") -> bool:
+    """Detect Zoom even when the link is a Canvas LTI launch."""
+    if is_zoom_url(url):
+        return True
+    haystack = f"{url} {title} {source_title}".lower()
+    return "zoom" in haystack
 
 # Default to Google Drive on Mac, fallback to local
 def get_download_dir():
@@ -77,7 +166,10 @@ class LinkExtractor(HTMLParser):
         self.file_links = []  # Direct file download links
         self.video_links = []  # Video embeds
         self.external_links = []  # External URLs
+        self.internal_links = []  # Canvas/internal URLs (pages, modules, etc.)
         self.current_link = None
+        self.current_link_attrs = {}
+        self.current_link_text_parts = []
         self.in_script = False
         self.in_style = False
     
@@ -92,7 +184,8 @@ class LinkExtractor(HTMLParser):
             href = attrs_dict.get('href', '')
             if href and not href.startswith('#') and not href.startswith('javascript:'):
                 self.current_link = href
-                self._categorize_link(href, attrs_dict.get('title', ''))
+                self.current_link_attrs = attrs_dict
+                self.current_link_text_parts = []
         elif tag == 'iframe':
             src = attrs_dict.get('src', '')
             if src:
@@ -114,24 +207,35 @@ class LinkExtractor(HTMLParser):
         elif tag == 'li':
             self.text_parts.append('\n• ')
     
-    def _categorize_link(self, href: str, title: str = ''):
+    def _categorize_link(self, href: str, title: str = '', text: str = '') -> dict:
         """Categorize a link by type."""
-        link_info = {'url': href, 'title': title}
+        href_abs = normalize_url(href)
+        resolved = unwrap_canvas_deep_link(href_abs) or href_abs
+        link_info = {
+            'url': href_abs,
+            'resolved_url': resolved,
+            'title': title,
+            'text': text
+        }
         
         # Canvas file links
-        if '/files/' in href:
+        if '/files/' in resolved:
             self.file_links.append(link_info)
         # Video platforms
-        elif any(v in href for v in ['youtube.com', 'youtu.be', 'vimeo.com', 'kaltura', 'panopto']):
+        elif any(v in resolved for v in ['youtube.com', 'youtu.be', 'vimeo.com', 'kaltura', 'panopto']):
             self.video_links.append({**link_info, 'type': 'external_video'})
         # Media objects
-        elif '/media_objects/' in href or '/media/' in href:
+        elif '/media_objects/' in resolved or '/media/' in resolved:
             self.video_links.append({**link_info, 'type': 'canvas_media'})
         # External links
-        elif href.startswith('http') and 'canvas.santarosa.edu' not in href:
+        elif resolved.startswith('mailto:') or (resolved.startswith('http') and 'canvas.santarosa.edu' not in resolved):
             self.external_links.append(link_info)
+        # Internal Canvas links
+        elif resolved.startswith('http') and 'canvas.santarosa.edu' in resolved:
+            self.internal_links.append(link_info)
         
         self.links.append(link_info)
+        return link_info
     
     def _handle_iframe(self, src: str, attrs: dict):
         """Handle iframe embeds (often videos)."""
@@ -148,14 +252,36 @@ class LinkExtractor(HTMLParser):
         elif tag == 'style':
             self.in_style = False
         elif tag == 'a':
+            if self.current_link:
+                title = (
+                    self.current_link_attrs.get('title')
+                    or self.current_link_attrs.get('aria-label')
+                    or ''
+                )
+                text = ' '.join(self.current_link_text_parts).strip()
+                link_info = self._categorize_link(self.current_link, title=title, text=text)
+
+                display = (text or title or (link_info.get('resolved_url') or link_info.get('url') or '')).strip()
+                url = (link_info.get('resolved_url') or link_info.get('url') or '').strip()
+                if url:
+                    if display and display != url:
+                        self.text_parts.append(f"{display} ({url})")
+                    else:
+                        self.text_parts.append(url)
+
             self.current_link = None
+            self.current_link_attrs = {}
+            self.current_link_text_parts = []
     
     def handle_data(self, data):
         if self.in_script or self.in_style:
             return
         text = data.strip()
         if text:
-            self.text_parts.append(text)
+            if self.current_link is not None:
+                self.current_link_text_parts.append(text)
+            else:
+                self.text_parts.append(text)
     
     def get_text(self) -> str:
         """Get clean text."""
@@ -175,7 +301,8 @@ def extract_content(html: str) -> dict:
             'all_links': parser.links or [],
             'file_links': parser.file_links or [],
             'video_links': parser.video_links or [],
-            'external_links': parser.external_links or []
+            'external_links': parser.external_links or [],
+            'internal_links': parser.internal_links or []
         }
     except Exception:
         # Fallback - always return all keys
@@ -185,7 +312,8 @@ def extract_content(html: str) -> dict:
             'all_links': [], 
             'file_links': [], 
             'video_links': [], 
-            'external_links': []
+            'external_links': [],
+            'internal_links': []
         }
 
 
@@ -202,6 +330,12 @@ class SyncItem:
     content_hash: Optional[str] = None
     file_size: Optional[int] = None
     links: Optional[list] = None
+    # Scheduling / context (used for weekly bundling)
+    due_at: Optional[str] = None
+    unlock_at: Optional[str] = None
+    module_id: Optional[str] = None
+    module_name: Optional[str] = None
+    module_unlock_at: Optional[str] = None
 
 
 class SyncTracker:
@@ -267,9 +401,12 @@ class SyncTracker:
 class CanvasSync:
     """Main Canvas content syncer."""
     
-    def __init__(self, force_sync: bool = False, course_filter: str = None):
+    def __init__(self, force_sync: bool = False, course_filter: str = None, bundle_weeks: bool = False):
         self.force_sync = force_sync
         self.course_filter = course_filter.lower() if course_filter else None
+        # Also keep a whitespace-stripped variant so "FDNT 10" matches "FDNT10"
+        self.course_filter_compact = re.sub(r"\s+", "", self.course_filter) if self.course_filter else None
+        self.bundle_weeks = bundle_weeks
         self.cookies = {}
         self.headers = {
             "Accept": "application/json",
@@ -292,6 +429,76 @@ class CanvasSync:
         self.cookies = {c["name"]: c["value"] for c in data.get("cookies", [])}
         print(f"✅ Loaded session ({len(self.cookies)} cookies)")
         return True
+
+    def unwrap_canvas_deep_link(self, url: str) -> Optional[str]:
+        """Best-effort unwrap of Canvas redirect/launch URLs to their external target.
+
+        Canvas often wraps external resources in URLs like:
+        - /courses/.../external_tools/retrieve?url=<encoded>
+        - /courses/.../external_url?url=<encoded>
+        This tries to extract and decode those embedded targets.
+        """
+        if not url:
+            return None
+
+        # Make absolute so urlparse has host info for relative Canvas links.
+        url_abs = url
+        if url.startswith("/"):
+            url_abs = f"{CANVAS_URL}{url}"
+
+        try:
+            parsed = urlparse(url_abs)
+        except Exception:
+            return None
+
+        host = (parsed.hostname or "").lower()
+        if host and host != urlparse(CANVAS_URL).hostname:
+            # Already external.
+            return None
+
+        qs = parse_qs(parsed.query or "")
+        # Common parameter names used to carry external targets.
+        candidate_params = ["url", "redirect", "redirect_uri", "return_to", "next", "target"]
+        candidates: list[str] = []
+        for k in candidate_params:
+            for v in qs.get(k, []):
+                if v:
+                    candidates.append(v)
+
+        def decode_maybe_twice(s: str) -> str:
+            # Canvas links are often percent-encoded once (sometimes nested).
+            s1 = unquote(s)
+            s2 = unquote(s1)
+            return s2
+
+        for cand in candidates:
+            decoded = decode_maybe_twice(cand).strip()
+            if not decoded:
+                continue
+            if decoded.startswith("/"):
+                decoded = f"{CANVAS_URL}{decoded}"
+            if decoded.startswith("http"):
+                try:
+                    decoded_host = (urlparse(decoded).hostname or "").lower()
+                    if decoded_host and decoded_host != urlparse(CANVAS_URL).hostname:
+                        return decoded
+                except Exception:
+                    # If it looks like a URL but parsing fails, still prefer it.
+                    return decoded
+        return None
+
+    def _unique_url_shortcut_path(self, desired_path: Path, *, discriminator: str) -> Path:
+        """Avoid collisions for .url shortcuts (titles are often duplicated/truncated).
+
+        If the desired path already exists, create a stable unique variant by appending
+        the discriminator (usually the Canvas module item ID).
+        """
+        if not desired_path.exists():
+            return desired_path
+        # If already has discriminator, keep it.
+        if discriminator and discriminator in desired_path.stem:
+            return desired_path
+        return desired_path.with_name(f"{desired_path.stem}_{discriminator}{desired_path.suffix}")
     
     async def api_get(self, endpoint: str, params: dict = None) -> dict | list | None:
         """Make authenticated API request."""
@@ -347,9 +554,19 @@ class CanvasSync:
         
         return results
     
-    async def download_file(self, url: str, dest_path: Path, item_id: str = None,
-                           updated_at: str = None, title: str = None, 
-                           course_id: int = None, file_id: int = None) -> bool:
+    async def download_file(
+        self,
+        url: str,
+        dest_path: Path,
+        item_id: str = None,
+        updated_at: str = None,
+        title: str = None,
+        course_id: int = None,
+        file_id: int = None,
+        module_id: Optional[int] = None,
+        module_name: Optional[str] = None,
+        module_unlock_at: Optional[str] = None,
+    ) -> bool:
         """Download a file with tracking."""
         try:
             # Skip if already synced and not changed
@@ -358,30 +575,43 @@ class CanvasSync:
                     self.stats["skipped"] += 1
                     return True
             
-            async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True,
-                                          timeout=300) as client:
-                resp = await client.get(url)
-                
-                if resp.status_code == 200:
+            async with httpx.AsyncClient(
+                cookies=self.cookies,
+                follow_redirects=True,
+                timeout=300,
+            ) as client:
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code != 200:
+                        return False
+
                     # Get actual filename from Content-Disposition if available
                     cd = resp.headers.get("content-disposition", "")
                     if "filename=" in cd:
-                        match = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^";\n\r\']+)', cd, re.IGNORECASE)
+                        match = re.search(
+                            r'filename\*?=["\']?(?:UTF-8\'\')?([^";\n\r\']+)',
+                            cd,
+                            re.IGNORECASE,
+                        )
                         if match:
                             actual_name = unquote(match.group(1))
                             dest_path = dest_path.parent / self.sanitize_filename(actual_name)
-                    
+
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    bytes_written = 0
                     with open(dest_path, "wb") as f:
-                        f.write(resp.content)
-                    
+                        async for chunk in resp.aiter_bytes():
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            bytes_written += len(chunk)
+
                     # Check if it's a PowerPoint file - add Canvas page link for inline videos
-                    is_powerpoint = dest_path.suffix.lower() in ['.ppt', '.pptx']
+                    is_powerpoint = dest_path.suffix.lower() in [".ppt", ".pptx"]
                     canvas_file_url = None
                     if is_powerpoint and course_id and file_id:
                         canvas_file_url = f"{CANVAS_URL}/courses/{course_id}/files/{file_id}"
                         # Create a companion file with the Canvas link
-                        link_file = dest_path.with_suffix(dest_path.suffix + '.canvas_link.txt')
+                        link_file = dest_path.with_suffix(dest_path.suffix + ".canvas_link.txt")
                         with open(link_file, "w", encoding="utf-8") as f:
                             f.write("=" * 60 + "\n")
                             f.write(f"CANVAS PAGE LINK FOR: {dest_path.name}\n")
@@ -391,36 +621,41 @@ class CanvasSync:
                             f.write(f"🔗 {canvas_file_url}\n\n")
                             f.write("Note: Inline videos in PowerPoint files cannot be extracted.\n")
                             f.write("Please view this file on Canvas to see any embedded videos.\n")
-                    
+
                     # Track the download
                     tracked_links = []
                     if canvas_file_url:
-                        tracked_links.append({
-                            'url': canvas_file_url,
-                            'title': 'Canvas File Page (for inline videos)',
-                            'type': 'canvas_file_page'
-                        })
-                    
+                        tracked_links.append(
+                            {
+                                "url": canvas_file_url,
+                                "title": "Canvas File Page (for inline videos)",
+                                "type": "canvas_file_page",
+                            }
+                        )
+
                     if item_id:
-                        self.tracker.mark_synced(SyncItem(
-                            item_id=item_id,
-                            item_type="file",
-                            title=title or dest_path.name,
-                            updated_at=updated_at or "",
-                            file_path=str(dest_path.relative_to(DOWNLOAD_DIR)),
-                            source_url=canvas_file_url or url,
-                            file_size=len(resp.content),
-                            links=tracked_links if tracked_links else None
-                        ))
+                        self.tracker.mark_synced(
+                            SyncItem(
+                                item_id=item_id,
+                                item_type="file",
+                                title=title or dest_path.name,
+                                updated_at=updated_at or "",
+                                file_path=str(dest_path.relative_to(DOWNLOAD_DIR)),
+                                source_url=canvas_file_url or url,
+                                file_size=bytes_written,
+                                module_id=str(module_id) if module_id is not None else None,
+                                module_name=module_name,
+                                module_unlock_at=module_unlock_at,
+                                links=tracked_links if tracked_links else None,
+                            )
+                        )
                         self.stats["new"] += 1
-                    
+
                     if is_powerpoint:
                         print(f"      ✅ {dest_path.name} (PowerPoint - Canvas link saved)")
                     else:
                         print(f"      ✅ {dest_path.name}")
                     return True
-                else:
-                    return False
                     
         except Exception as e:
             print(f"      ❌ Download error: {e}")
@@ -462,8 +697,13 @@ class CanvasSync:
                 continue
             
             # Apply course filter if specified
-            if self.course_filter and self.course_filter not in name.lower():
-                continue
+            if self.course_filter:
+                name_lower = name.lower()
+                name_compact = re.sub(r"\s+", "", name_lower)
+                if (self.course_filter not in name_lower) and (
+                    self.course_filter_compact and (self.course_filter_compact not in name_compact)
+                ):
+                    continue
             
             filtered.append(c)
             print(f"   📖 {name}")
@@ -579,6 +819,7 @@ class CanvasSync:
                 title=module.get("name"),
                 updated_at=module.get("updated_at", ""),
                 file_path=str(module_dir.relative_to(DOWNLOAD_DIR)),
+                unlock_at=unlock_at,
                 source_url=f"{CANVAS_URL}/courses/{course_id}/modules/{module_id}" if course_id else None
             ))
             
@@ -617,9 +858,25 @@ class CanvasSync:
             
             # Process each item in the module
             for item in items:
-                await self.sync_module_item(course_id, item, module_dir, module_name)
+                await self.sync_module_item(
+                    course_id,
+                    item,
+                    module_dir,
+                    module_name,
+                    module_id=module_id,
+                    module_unlock_at=unlock_at,
+                )
     
-    async def sync_module_item(self, course_id: int, item: dict, module_dir: Path, module_name: str):
+    async def sync_module_item(
+        self,
+        course_id: int,
+        item: dict,
+        module_dir: Path,
+        module_name: str,
+        *,
+        module_id: Optional[int] = None,
+        module_unlock_at: Optional[str] = None,
+    ):
         """Sync a single module item with full link extraction."""
         item_type = item.get("type", "").lower()
         item_id = item.get("id")
@@ -640,7 +897,10 @@ class CanvasSync:
                         updated_at=file_info.get("updated_at"),
                         title=title,
                         course_id=course_id,
-                        file_id=content_id
+                        file_id=content_id,
+                        module_id=module_id,
+                        module_name=module_name,
+                        module_unlock_at=module_unlock_at,
                     )
         
         elif item_type == "page":
@@ -649,21 +909,45 @@ class CanvasSync:
             if page_url:
                 page = await self.api_get(f"/courses/{course_id}/pages/{page_url}")
                 if page:
-                    await self.save_page_with_links(page, module_dir, title, course_id)
+                    await self.save_page_with_links(
+                        page,
+                        module_dir,
+                        title,
+                        course_id,
+                        module_id=module_id,
+                        module_name=module_name,
+                        module_unlock_at=module_unlock_at,
+                    )
         
         elif item_type == "assignment":
             # Assignment details
             if content_id:
                 assignment = await self.api_get(f"/courses/{course_id}/assignments/{content_id}")
                 if assignment:
-                    await self.save_assignment(assignment, module_dir, title, course_id)
+                    await self.save_assignment(
+                        assignment,
+                        module_dir,
+                        title,
+                        course_id,
+                        module_id=module_id,
+                        module_name=module_name,
+                        module_unlock_at=module_unlock_at,
+                    )
         
         elif item_type == "quiz":
             # Quiz in module
             if content_id:
                 quiz = await self.api_get(f"/courses/{course_id}/quizzes/{content_id}")
                 if quiz:
-                    await self.save_quiz(quiz, module_dir, title, course_id)
+                    await self.save_quiz(
+                        quiz,
+                        module_dir,
+                        title,
+                        course_id,
+                        module_id=module_id,
+                        module_name=module_name,
+                        module_unlock_at=module_unlock_at,
+                    )
         
         elif item_type == "discussion":
             # Discussion topic
@@ -674,57 +958,92 @@ class CanvasSync:
         
         elif item_type == "externalurl":
             # External URL - save as .url file and track link
-            url = item.get("external_url", "")
-            if url:
+            raw_url = item.get("external_url", "")
+            if raw_url:
+                resolved = self.unwrap_canvas_deep_link(raw_url) or raw_url
                 url_file = module_dir / f"{self.sanitize_filename(title)}.url"
+                url_file = self._unique_url_shortcut_path(url_file, discriminator=str(item_id))
+                link_txt = module_dir / f"{self.sanitize_filename(title)}.link.txt"
+                link_txt = self._unique_url_shortcut_path(link_txt, discriminator=str(item_id))
                 
                 # Check if needs sync
                 if not self.force_sync:
-                    if not self.tracker.needs_sync(f"exturl_{item_id}", url, url_file):
+                    version = resolved if resolved == raw_url else f"{raw_url} -> {resolved}"
+                    if not self.tracker.needs_sync(f"exturl_{item_id}", version, url_file):
                         self.stats["skipped"] += 1
                         return
                 
                 with open(url_file, "w") as f:
-                    f.write(f"[InternetShortcut]\nURL={url}\n")
+                    f.write(f"[InternetShortcut]\nURL={resolved}\n")
+
+                # Also write a plain-text link file (clickable in Google Drive web preview).
+                with open(link_txt, "w", encoding="utf-8") as f:
+                    f.write(f"{title}\n")
+                    f.write("=" * 60 + "\n\n")
+                    f.write(f"{resolved}\n")
+                    if resolved != raw_url:
+                        f.write("\nRaw Canvas URL (wrapper):\n")
+                        f.write(f"{raw_url}\n")
                 
                 # Track with link info
                 self.tracker.mark_synced(SyncItem(
                     item_id=f"exturl_{item_id}",
                     item_type="external_url",
                     title=title,
-                    updated_at=url,  # Use URL as version identifier
+                    updated_at=resolved if resolved == raw_url else f"{raw_url} -> {resolved}",
                     file_path=str(url_file.relative_to(DOWNLOAD_DIR)),
-                    source_url=url,
-                    links=[{"url": url, "title": title, "type": "external_url"}]
+                    source_url=resolved,
+                    module_id=str(module_id) if module_id is not None else None,
+                    module_name=module_name,
+                    module_unlock_at=module_unlock_at,
+                    links=[{"url": resolved, "title": title, "type": "external_url"}]
                 ))
                 print(f"      🔗 {title}")
                 self.stats["new"] += 1
         
         elif item_type == "externaltool":
             # External tool (might be video embed, LTI content, etc.)
-            url = item.get("url") or item.get("external_url", "")
-            if url:
+            raw_url = item.get("url") or item.get("external_url", "")
+            if raw_url:
+                # Prefer the embedded external target if Canvas wrapped it.
+                resolved = self.unwrap_canvas_deep_link(raw_url) or raw_url
                 url_file = module_dir / f"{self.sanitize_filename(title)}_tool.url"
+                url_file = self._unique_url_shortcut_path(url_file, discriminator=str(item_id))
+                link_txt = module_dir / f"{self.sanitize_filename(title)}_tool.link.txt"
+                link_txt = self._unique_url_shortcut_path(link_txt, discriminator=str(item_id))
                 
                 # Check if needs sync
                 if not self.force_sync:
-                    if not self.tracker.needs_sync(f"exttool_{item_id}", url, url_file):
+                    version = resolved if resolved == raw_url else f"{raw_url} -> {resolved}"
+                    if not self.tracker.needs_sync(f"exttool_{item_id}", version, url_file):
                         self.stats["skipped"] += 1
                         return
                 
                 # Save the link
                 with open(url_file, "w") as f:
-                    f.write(f"[InternetShortcut]\nURL={url}\n")
+                    f.write(f"[InternetShortcut]\nURL={resolved}\n")
+
+                # Also write a plain-text link file (clickable in Google Drive web preview).
+                with open(link_txt, "w", encoding="utf-8") as f:
+                    f.write(f"{title}\n")
+                    f.write("=" * 60 + "\n\n")
+                    f.write(f"{resolved}\n")
+                    if resolved != raw_url:
+                        f.write("\nRaw Canvas URL (wrapper):\n")
+                        f.write(f"{raw_url}\n")
                 
                 # Track with link info
                 self.tracker.mark_synced(SyncItem(
                     item_id=f"exttool_{item_id}",
                     item_type="external_tool",
                     title=title,
-                    updated_at=url,
+                    updated_at=resolved if resolved == raw_url else f"{raw_url} -> {resolved}",
                     file_path=str(url_file.relative_to(DOWNLOAD_DIR)),
-                    source_url=url,
-                    links=[{"url": url, "title": title, "type": "external_tool"}]
+                    source_url=resolved,
+                    module_id=str(module_id) if module_id is not None else None,
+                    module_name=module_name,
+                    module_unlock_at=module_unlock_at,
+                    links=[{"url": resolved, "title": title, "type": "external_tool"}]
                 ))
                 print(f"      🔧 {title} (external tool)")
                 self.stats["new"] += 1
@@ -733,7 +1052,17 @@ class CanvasSync:
             # Just a section header, skip
             pass
     
-    async def save_page_with_links(self, page: dict, dest_dir: Path, title: str, course_id: int):
+    async def save_page_with_links(
+        self,
+        page: dict,
+        dest_dir: Path,
+        title: str,
+        course_id: int,
+        *,
+        module_id: Optional[int] = None,
+        module_name: Optional[str] = None,
+        module_unlock_at: Optional[str] = None,
+    ):
         """Save a page and download all linked files."""
         body = page.get("body", "")
         if not body:
@@ -756,6 +1085,7 @@ class CanvasSync:
         content.setdefault('file_links', [])
         content.setdefault('video_links', [])
         content.setdefault('external_links', [])
+        content.setdefault('internal_links', [])
         content.setdefault('all_links', [])
         content.setdefault('text', '')
         
@@ -774,12 +1104,22 @@ class CanvasSync:
             output.append("LINKS FOUND IN THIS PAGE:")
             output.append("-" * 40)
             
+            for link in content.get('internal_links', []):
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  🧭 CANVAS: {label + ' - ' if label else ''}{url}")
             for link in content.get('file_links', []):
-                output.append(f"  📄 FILE: {link.get('url', '')}")
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  📄 FILE: {label + ' - ' if label else ''}{url}")
             for link in content.get('video_links', []):
-                output.append(f"  🎥 VIDEO: {link.get('url', '')}")
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  🎥 VIDEO: {label + ' - ' if label else ''}{url}")
             for link in content.get('external_links', []):
-                output.append(f"  🔗 EXTERNAL: {link.get('url', '')}")
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  🔗 EXTERNAL: {label + ' - ' if label else ''}{url}")
         
         filepath = dest_dir / f"{self.sanitize_filename(title)}.txt"
         with open(filepath, "w", encoding="utf-8") as f:
@@ -792,6 +1132,9 @@ class CanvasSync:
             title=page.get("title", title),
             updated_at=updated_at,
             file_path=str(filepath.relative_to(DOWNLOAD_DIR)),
+            module_id=str(module_id) if module_id is not None else None,
+            module_name=module_name,
+            module_unlock_at=module_unlock_at,
             links=content.get('all_links', [])
         ))
         
@@ -868,7 +1211,17 @@ class CanvasSync:
                         f.write(f"Title: {video.get('title')}\n")
                     f.write("\n")
     
-    async def save_assignment(self, assignment: dict, dest_dir: Path, title: str, course_id: int = None):
+    async def save_assignment(
+        self,
+        assignment: dict,
+        dest_dir: Path,
+        title: str,
+        course_id: int = None,
+        *,
+        module_id: Optional[int] = None,
+        module_name: Optional[str] = None,
+        module_unlock_at: Optional[str] = None,
+    ):
         """Save assignment details and download all linked files."""
         description = assignment.get("description", "") or ""
         content = extract_content(description) if description else {
@@ -883,6 +1236,7 @@ class CanvasSync:
         content.setdefault('file_links', [])
         content.setdefault('video_links', [])
         content.setdefault('external_links', [])
+        content.setdefault('internal_links', [])
         content.setdefault('all_links', [])
         
         assignment_id = assignment.get('id')
@@ -920,12 +1274,22 @@ class CanvasSync:
             output.append("-" * 40)
             output.append("LINKS FOUND IN THIS ASSIGNMENT:")
             output.append("-" * 40)
+            for link in content.get('internal_links', []):
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  🧭 CANVAS: {label + ' - ' if label else ''}{url}")
             for link in content.get('file_links', []):
-                output.append(f"  📄 FILE: {link.get('url', '')}")
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  📄 FILE: {label + ' - ' if label else ''}{url}")
             for link in content.get('video_links', []):
-                output.append(f"  🎥 VIDEO: {link.get('url', '')}")
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  🎥 VIDEO: {label + ' - ' if label else ''}{url}")
             for link in content.get('external_links', []):
-                output.append(f"  🔗 EXTERNAL: {link.get('url', '')}")
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  🔗 EXTERNAL: {label + ' - ' if label else ''}{url}")
         
         filepath = dest_dir / f"{self.sanitize_filename(title)}.txt"
         with open(filepath, "w", encoding="utf-8") as f:
@@ -947,6 +1311,10 @@ class CanvasSync:
             updated_at=updated_at,
             file_path=str(filepath.relative_to(DOWNLOAD_DIR)),
             source_url=canvas_url,
+            due_at=assignment.get("due_at"),
+            module_id=str(module_id) if module_id is not None else None,
+            module_name=module_name,
+            module_unlock_at=module_unlock_at,
             links=all_tracked_links
         ))
         
@@ -984,7 +1352,17 @@ class CanvasSync:
                     file_id=int(file_id) if file_id else None
                 )
     
-    async def save_quiz(self, quiz: dict, dest_dir: Path, title: str, course_id: int):
+    async def save_quiz(
+        self,
+        quiz: dict,
+        dest_dir: Path,
+        title: str,
+        course_id: int,
+        *,
+        module_id: Optional[int] = None,
+        module_name: Optional[str] = None,
+        module_unlock_at: Optional[str] = None,
+    ):
         """Save quiz details and questions if available, with full link extraction."""
         quiz_id = quiz.get("id")
         description = quiz.get("description", "") or ""
@@ -1000,6 +1378,7 @@ class CanvasSync:
         content.setdefault('file_links', [])
         content.setdefault('video_links', [])
         content.setdefault('external_links', [])
+        content.setdefault('internal_links', [])
         content.setdefault('all_links', [])
         
         updated_at = quiz.get("updated_at", "")
@@ -1059,12 +1438,15 @@ class CanvasSync:
             output.append("-" * 40)
             output.append("LINKS FOUND IN THIS QUIZ:")
             output.append("-" * 40)
-            for link in content.get('file_links', []):
-                output.append(f"  📄 FILE: {link.get('url', '')}")
-            for link in content.get('video_links', []):
-                output.append(f"  🎥 VIDEO: {link.get('url', '')}")
-            for link in content.get('external_links', []):
-                output.append(f"  🔗 EXTERNAL: {link.get('url', '')}")
+            for link in all_links:
+                url = (link.get('resolved_url') or link.get('url') or '').strip()
+                if not url:
+                    continue
+                label = (link.get('text') or link.get('title') or '').strip()
+                if label and label != url:
+                    output.append(f"  • {label} - {url}")
+                else:
+                    output.append(f"  • {url}")
         
         filepath = dest_dir / f"{self.sanitize_filename(title)}.txt"
         with open(filepath, "w", encoding="utf-8") as f:
@@ -1086,6 +1468,10 @@ class CanvasSync:
             updated_at=updated_at,
             file_path=str(filepath.relative_to(DOWNLOAD_DIR)),
             source_url=canvas_url,
+            due_at=quiz.get("due_at"),
+            module_id=str(module_id) if module_id is not None else None,
+            module_name=module_name,
+            module_unlock_at=module_unlock_at,
             links=all_tracked_links
         ))
         
@@ -1137,6 +1523,7 @@ class CanvasSync:
         content.setdefault('file_links', [])
         content.setdefault('video_links', [])
         content.setdefault('external_links', [])
+        content.setdefault('internal_links', [])
         content.setdefault('all_links', [])
         
         discussion_id = discussion.get('id')
@@ -1162,12 +1549,22 @@ class CanvasSync:
             output.append("-" * 40)
             output.append("LINKS FOUND IN THIS DISCUSSION:")
             output.append("-" * 40)
+            for link in content.get('internal_links', []):
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  🧭 CANVAS: {label + ' - ' if label else ''}{url}")
             for link in content.get('file_links', []):
-                output.append(f"  📄 FILE: {link.get('url', '')}")
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  📄 FILE: {label + ' - ' if label else ''}{url}")
             for link in content.get('video_links', []):
-                output.append(f"  🎥 VIDEO: {link.get('url', '')}")
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  🎥 VIDEO: {label + ' - ' if label else ''}{url}")
             for link in content.get('external_links', []):
-                output.append(f"  🔗 EXTERNAL: {link.get('url', '')}")
+                url = link.get('resolved_url') or link.get('url', '')
+                label = (link.get('text') or link.get('title') or '').strip()
+                output.append(f"  🔗 EXTERNAL: {label + ' - ' if label else ''}{url}")
         
         filepath = dest_dir / f"{self.sanitize_filename(title)}.txt"
         with open(filepath, "w", encoding="utf-8") as f:
@@ -1283,7 +1680,14 @@ class CanvasSync:
             output.append("-" * 40)
             output.append("LINKS:")
             for link in content['all_links']:
-                output.append(f"  • {link['url']}")
+                url = (link.get('resolved_url') or link.get('url') or '').strip()
+                if not url:
+                    continue
+                label = (link.get('text') or link.get('title') or '').strip()
+                if label and label != url:
+                    output.append(f"  • {label} - {url}")
+                else:
+                    output.append(f"  • {url}")
         
         filepath = self.current_course_dir / "syllabus.txt"
         with open(filepath, "w", encoding="utf-8") as f:
@@ -1420,6 +1824,7 @@ class CanvasSync:
         links_by_type = {
             "files": [],
             "videos": [],
+            "zoom": [],
             "external": [],
             "other": []
         }
@@ -1427,23 +1832,26 @@ class CanvasSync:
         for item in self.tracker.state["items"].values():
             if item.get("links"):
                 for link in item["links"]:
+                    url_raw = link.get("url", "")
                     link_entry = {
                         "source_type": item.get("item_type", "unknown"),
                         "source_title": item.get("title", "Unknown"),
                         "source_path": item.get("file_path", ""),
-                        "url": link.get("url", ""),
+                        "url": url_raw,
                         "title": link.get("title", ""),
                         "type": link.get("type", "unknown")
                     }
                     all_links.append(link_entry)
                     
                     # Categorize
-                    url = link.get("url", "").lower()
-                    if "/files/" in url or "file" in link.get("type", "").lower():
+                    url_lower = url_raw.lower()
+                    if is_zoom_related(url_raw, link_entry.get("title", ""), link_entry.get("source_title", "")):
+                        links_by_type["zoom"].append(link_entry)
+                    elif "/files/" in url_lower or "file" in link.get("type", "").lower():
                         links_by_type["files"].append(link_entry)
-                    elif any(v in url for v in ["youtube", "vimeo", "kaltura", "panopto", "video", "media"]):
+                    elif any(v in url_lower for v in ["youtube", "vimeo", "kaltura", "panopto", "video", "media"]):
                         links_by_type["videos"].append(link_entry)
-                    elif url.startswith("http") and "canvas.santarosa.edu" not in url:
+                    elif url_lower.startswith("http") and "canvas.santarosa.edu" not in url_lower:
                         links_by_type["external"].append(link_entry)
                     else:
                         links_by_type["other"].append(link_entry)
@@ -1456,6 +1864,7 @@ class CanvasSync:
                     "by_type": {
                         "files": len(links_by_type["files"]),
                         "videos": len(links_by_type["videos"]),
+                        "zoom": len(links_by_type["zoom"]),
                         "external": len(links_by_type["external"]),
                         "other": len(links_by_type["other"])
                     },
@@ -1470,10 +1879,20 @@ class CanvasSync:
                 f.write(f"Total links: {len(all_links)}\n")
                 f.write(f"  - Files: {len(links_by_type['files'])}\n")
                 f.write(f"  - Videos: {len(links_by_type['videos'])}\n")
+                f.write(f"  - Zoom: {len(links_by_type['zoom'])}\n")
                 f.write(f"  - External: {len(links_by_type['external'])}\n")
                 f.write(f"  - Other: {len(links_by_type['other'])}\n")
                 f.write("\n" + "=" * 80 + "\n\n")
                 
+                # Zoom section
+                if links_by_type["zoom"]:
+                    f.write("ZOOM LINKS:\n")
+                    f.write("-" * 80 + "\n")
+                    for link in links_by_type["zoom"]:
+                        f.write(f"🎦 {link['url']}\n")
+                        f.write(f"   From: {link['source_title']} ({link['source_type']})\n\n")
+                    f.write("\n")
+
                 # Files section
                 if links_by_type["files"]:
                     f.write("FILE LINKS:\n")
@@ -1510,6 +1929,49 @@ class CanvasSync:
                         f.write(f"   From: {link['source_title']} ({link['source_type']})\n\n")
             
             print(f"   📋 Saved {len(all_links)} links to _all_links.json and _all_links.txt")
+
+            # Save dedicated Zoom link list (useful for adding to calendars later)
+            if links_by_type["zoom"]:
+                seen_urls = set()
+                unique_zoom = []
+                for entry in links_by_type["zoom"]:
+                    u = (entry.get("url") or "").strip()
+                    if not u or u in seen_urls:
+                        continue
+                    seen_urls.add(u)
+                    unique_zoom.append(entry)
+
+                # Always include the Zoom LTI "advantage" portal as a fallback entry point
+                if ZOOM_LTI_ADVANTAGE_URL not in seen_urls:
+                    unique_zoom.insert(0, {
+                        "source_type": "meta",
+                        "source_title": course.get("name", "Course"),
+                        "source_path": "",
+                        "url": ZOOM_LTI_ADVANTAGE_URL,
+                        "title": "Zoom LTI (Advantage) portal",
+                        "type": "zoom_portal"
+                    })
+
+                with open(self.current_course_dir / "_zoom_links.json", "w") as f:
+                    json.dump({
+                        "total_zoom_links": len(unique_zoom),
+                        "links": unique_zoom
+                    }, f, indent=2)
+
+                with open(self.current_course_dir / "_zoom_links.txt", "w", encoding="utf-8") as f:
+                    f.write("=" * 80 + "\n")
+                    f.write(f"ZOOM LINKS FROM: {course.get('name', 'Course')}\n")
+                    f.write("=" * 80 + "\n\n")
+                    for link in unique_zoom:
+                        title = (link.get("title") or "").strip()
+                        from_title = (link.get("source_title") or "").strip()
+                        from_type = (link.get("source_type") or "").strip()
+                        if title:
+                            f.write(f"{title}\n")
+                        f.write(f"{link.get('url','')}\n")
+                        if from_title or from_type:
+                            f.write(f"From: {from_title} ({from_type})\n")
+                        f.write("\n")
     
     def sanitize_filename(self, name: str) -> str:
         """Make string safe for filename."""
@@ -1544,24 +2006,762 @@ class CanvasSync:
         
         for course in courses:
             await self.sync_course(course)
+
+        if self.bundle_weeks:
+            print("\n📅 Building weekly bundles...")
+            try:
+                bundle_weekly_exports(DOWNLOAD_DIR)
+                print("   ✅ Weekly bundles updated")
+            except Exception as e:
+                print(f"   ⚠️ Weekly bundling failed: {e}")
         
         print(f"\n{'='*60}")
         print("✅ Sync complete!")
         print(f"📂 Content saved to: {DOWNLOAD_DIR}")
 
 
+def _parse_canvas_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse Canvas ISO timestamps (usually UTC 'Z') into an aware datetime."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # Canvas commonly uses Z for UTC.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _iso_week_key(dt_local: datetime) -> str:
+    iso = dt_local.date().isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def _week_start_end_dates(week_key: str) -> tuple[date, date]:
+    # week_key format: YYYY-Www
+    try:
+        year_str, week_str = week_key.split("-W", 1)
+        iso_year = int(year_str)
+        iso_week = int(week_str)
+    except Exception as e:
+        raise ValueError(f"Invalid week key: {week_key}") from e
+    start = date.fromisocalendar(iso_year, iso_week, 1)  # Monday
+    end = date.fromisocalendar(iso_year, iso_week, 7)    # Sunday
+    return start, end
+
+
+def _looks_like_reading(title: str) -> bool:
+    t = title or ""
+    # Heuristic: only mark as reading when the title explicitly signals it.
+    return re.search(r"\b(read|reading|chapter|chapters|ch\.|pp\.)\b", t, flags=re.IGNORECASE) is not None
+
+
+def _extract_reading_spec(title: str) -> dict:
+    raw = title or ""
+    chapters = re.findall(
+        r"\bch(?:apter)?s?\.?\s*([0-9]+(?:\.[0-9]+)?(?:\s*[-–]\s*[0-9]+(?:\.[0-9]+)?)?)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    pages = re.findall(
+        r"\bpp?\.?\s*([0-9]+(?:\s*[-–]\s*[0-9]+)?)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    return {
+        "raw": raw,
+        "chapters": chapters,
+        "pages": pages,
+    }
+
+
+def _infer_due_at_from_text_file(download_dir: Path, local_relative_path: Optional[str]) -> Optional[str]:
+    """Backward-compatible: infer Due: ... from older saved assignment/quiz .txt files."""
+    if not local_relative_path:
+        return None
+    try:
+        p = download_dir / local_relative_path
+    except Exception:
+        return None
+    if not p.exists() or not p.is_file():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            for _ in range(120):  # only need the header
+                line = f.readline()
+                if not line:
+                    break
+                m = re.match(r"^\s*Due:\s*(.+?)\s*$", line)
+                if not m:
+                    continue
+                val = (m.group(1) or "").strip()
+                if not val or val.lower().startswith("no due"):
+                    return None
+                return val
+    except Exception:
+        return None
+    return None
+
+
+def _infer_module_folder_from_relative_path(local_relative_path: Optional[str]) -> Optional[str]:
+    """Infer the module folder name from a saved file path like: <course>/modules/<module>/..."""
+    if not local_relative_path:
+        return None
+    try:
+        parts = Path(str(local_relative_path)).parts
+    except Exception:
+        return None
+    for i, p in enumerate(parts):
+        if p == "modules" and i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def _stable_canvas_url_for_item(*, course_id: str, item_type: str, item_id: str, source_url: Optional[str]) -> Optional[str]:
+    """Return a stable Canvas URL when possible (file page, assignment page, etc.)."""
+    course_id = str(course_id or "").strip()
+    item_type = (item_type or "").strip().lower()
+    item_id = str(item_id or "").strip()
+
+    if not course_id:
+        return source_url
+
+    def suffix(prefix: str) -> Optional[str]:
+        return item_id[len(prefix):] if item_id.startswith(prefix) and len(item_id) > len(prefix) else None
+
+    if item_type == "assignment":
+        aid = suffix("assignment_")
+        return f"{CANVAS_URL}/courses/{course_id}/assignments/{aid}" if aid else source_url
+    if item_type == "quiz":
+        qid = suffix("quiz_")
+        return f"{CANVAS_URL}/courses/{course_id}/quizzes/{qid}" if qid else source_url
+    if item_type == "file":
+        fid = suffix("file_") or suffix("linked_file_")
+        return f"{CANVAS_URL}/courses/{course_id}/files/{fid}" if fid else source_url
+    if item_type == "page":
+        pid = suffix("page_")
+        return f"{CANVAS_URL}/courses/{course_id}/pages/{pid}" if pid else source_url
+    if item_type == "module":
+        mid = suffix("module_")
+        return f"{CANVAS_URL}/courses/{course_id}/modules/{mid}" if mid else source_url
+    if item_type == "discussion":
+        did = suffix("discussion_")
+        return f"{CANVAS_URL}/courses/{course_id}/discussion_topics/{did}" if did else source_url
+
+    return source_url
+
+
+def _resource_kind_from_url(url: str, link_type: str = "") -> str:
+    u = (url or "").lower()
+    t = (link_type or "").lower()
+    if "/files/" in u or "file" in t:
+        return "file"
+    if any(v in u for v in ["youtube.com", "youtu.be", "vimeo.com", "kaltura", "panopto", "media_objects", "/media/"]):
+        return "video"
+    if "ted.com/talks/" in u:
+        return "video"
+    if "canvas.santarosa.edu" in u:
+        return "canvas"
+    return "external"
+
+
+def _sanitize_weekly_path_component(name: str, max_len: int = 80) -> str:
+    """Safe folder/file component for weekly bundles."""
+    s = re.sub(r'[<>:"/\\|?*\n\r\t]', "_", str(name or "")).strip()
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    if len(s) > max_len:
+        s = s[:max_len].rstrip(" .")
+    return s or "untitled"
+
+
+def _is_video_file_relpath(relpath: str) -> bool:
+    p = str(relpath or "").lower()
+    return any(p.endswith(ext) for ext in [".mp4", ".m4v", ".mov", ".webm", ".mkv"])
+
+
+def _looks_like_recording(title: str, relpath: str = "") -> bool:
+    h = f"{title} {relpath}".lower()
+    return any(k in h for k in ["recording", "zoom recording", "class recording", "lecture recording", "session recording"])
+
+
+def _summarize_prep_focus(materials: list[dict], zoom_links: list[dict]) -> list[str]:
+    """Return short action phrases for a prep item title."""
+    actions: list[str] = []
+    if zoom_links:
+        actions.append("watch Zoom recording")
+
+    has_video = any((m.get("material_kind") == "video") or _is_video_file_relpath(m.get("local_relative_path", "")) for m in materials)
+    if has_video and "watch Zoom recording" not in actions:
+        actions.append("watch video")
+
+    has_reading = any((m.get("resource_category") == "reading") or (m.get("material_kind") == "reading") for m in materials)
+    if has_reading:
+        actions.append("do reading")
+
+    has_slides = any(re.search(r"\b(slides?|pptx?|powerpoint)\b", (m.get("title") or ""), flags=re.IGNORECASE) for m in materials)
+    if has_slides:
+        actions.append("review slides")
+
+    return actions[:3] or ["review materials"]
+
+
+def _priority_hint(kind: str, title: str) -> str:
+    k = (kind or "").lower()
+    t = (title or "").lower()
+    if k in {"assignment", "quiz"}:
+        # De-emphasize routine participation/attendance items vs learning/graded work.
+        if any(w in t for w in ["participation", "attendance", "check-in", "check in"]):
+            return "medium"
+        return "high"
+    if k == "prep":
+        return "high"
+    if k == "resource":
+        return "low"
+    return "medium"
+
+
+def _read_local_text_snippet(download_dir: Path, relpath: str, *, max_chars: int = 40_000) -> str:
+    if not relpath:
+        return ""
+    p = download_dir / relpath
+    if not p.exists() or not p.is_file():
+        return ""
+    if p.suffix.lower() not in [".txt", ".md", ".link", ".link.txt"]:
+        return ""
+    try:
+        data = p.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+    if len(data) > max_chars:
+        return data[:max_chars].rstrip() + "\n\n(…truncated…)\n"
+    return data
+
+
+def _write_task_bundle_file(
+    *,
+    download_dir: Path,
+    week_folder: Path,
+    task: dict,
+    materials: list[dict],
+    zoom_links: list[dict],
+) -> Optional[str]:
+    """Write a self-contained task bundle markdown file and return relpath (from download_dir)."""
+    course_name = ((task.get("course") or {}).get("name") or "course").strip()
+    safe_course = _sanitize_weekly_path_component(course_name)
+    safe_id = _sanitize_weekly_path_component(str(task.get("id") or task.get("title") or "task"))
+    safe_title = _sanitize_weekly_path_component(str(task.get("title") or "task"), max_len=60)
+
+    out_dir = week_folder / "tasks" / safe_course
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{safe_title}__{safe_id}.md"
+
+    lines: list[str] = []
+    lines.append(f"# {task.get('title') or 'Task'}")
+    lines.append("")
+    lines.append(f"- Course: {course_name}")
+    if task.get("scheduled_date_local"):
+        lines.append(f"- Scheduled: {task.get('scheduled_date_local')}")
+    if task.get("due_at"):
+        lines.append(f"- Due (Canvas): {task.get('due_at')}")
+    if task.get("direct_url"):
+        lines.append(f"- Canvas link: {task.get('direct_url')}")
+    lines.append("")
+
+    # Instructions / primary content
+    snippet = _read_local_text_snippet(download_dir, task.get("local_relative_path") or "")
+    if snippet:
+        lines.append("## Instructions / context")
+        lines.append("")
+        lines.append(snippet)
+        if not snippet.endswith("\n"):
+            lines.append("")
+
+    if zoom_links:
+        lines.append("## Zoom / class session")
+        lines.append("")
+        for z in zoom_links[:15]:
+            zurl = (z.get("url") or "").strip()
+            ztitle = (z.get("title") or z.get("text") or "").strip()
+            if ztitle:
+                lines.append(f"- {ztitle}: {zurl}")
+            else:
+                lines.append(f"- {zurl}")
+        lines.append("")
+
+    if materials:
+        lines.append("## Materials (everything referenced / in-module)")
+        lines.append("")
+        for m in materials[:80]:
+            title = (m.get("title") or "").strip() or "(untitled)"
+            local_rel = (m.get("local_relative_path") or "").strip()
+            url = (m.get("direct_url") or m.get("url") or "").strip()
+            kind = (m.get("material_kind") or m.get("resource_type") or m.get("resource_type") or "").strip()
+            parts = [f"- {title}"]
+            if kind:
+                parts.append(f"[{kind}]")
+            if local_rel:
+                parts.append(f"(local: {local_rel})")
+            if url and (not local_rel):
+                parts.append(f"({url})")
+            lines.append(" ".join(parts))
+        lines.append("")
+
+    # Simple learning-oriented nudges
+    if materials or zoom_links:
+        lines.append("## How to use this (learning-first)")
+        lines.append("")
+        lines.append("- Skim the instructions above, then open the materials in order.")
+        if any((m.get("resource_category") == "reading") or (m.get("material_kind") == "reading") for m in materials):
+            lines.append("- While reading, write down 3 key takeaways + 2 questions.")
+        if any(_is_video_file_relpath(m.get("local_relative_path", "")) for m in materials) or zoom_links:
+            lines.append("- While watching, pause to summarize each segment in 1–2 sentences.")
+        lines.append("- End by making a short checklist of what you can now explain from memory.")
+        lines.append("")
+
+    out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return str(out_path.relative_to(download_dir))
+
+
+def bundle_weekly_exports(download_dir: Path) -> None:
+    """Create ALL-inclusive weekly bundles under download_dir/_weekly/."""
+    weekly_dir = download_dir / "_weekly"
+    weekly_dir.mkdir(parents=True, exist_ok=True)
+
+    local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+
+    # We’ll build: tasks (assignments/quizzes/prep) + resources (module content + linked materials)
+    all_items: list[dict] = []
+    manifests = sorted(download_dir.glob("*/_manifest.json"))
+
+    # Index of manifest items to help attach local files to resources.
+    # Keys:
+    # - (course_id, item_id) -> item
+    # - (course_id, file_numeric_id) -> item
+    items_by_id: dict[tuple[str, str], dict] = {}
+    file_items_by_file_id: dict[tuple[str, str], dict] = {}
+    items_by_module_folder: dict[tuple[str, str], list[dict]] = {}
+
+    # First pass: load manifests and build indexes
+    manifests_loaded: list[tuple[Path, dict]] = []
+    for manifest_path in manifests:
+        try:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+        except Exception:
+            continue
+        manifests_loaded.append((manifest_path, manifest))
+
+        course = manifest.get("course") or {}
+        course_id = str(course.get("id", "") or "")
+        for it in (manifest.get("items") or []):
+            iid = str(it.get("item_id") or "")
+            if iid:
+                items_by_id[(course_id, iid)] = it
+            if (it.get("item_type") or "").strip().lower() == "file":
+                m = re.match(r"^(?:file|linked_file)_(\d+)$", iid)
+                if m:
+                    fid = m.group(1)
+                    file_items_by_file_id[(course_id, fid)] = it
+
+            module_folder = _infer_module_folder_from_relative_path(it.get("file_path"))
+            if module_folder:
+                items_by_module_folder.setdefault((course_id, module_folder), []).append(it)
+
+    # Second pass: build per-week buckets with dedupe
+    by_week: dict[str, dict[str, dict]] = {}
+    unscheduled: list[dict] = []
+
+    def add_to_week(week_key: Optional[str], item: dict):
+        if not week_key:
+            unscheduled.append(item)
+            return
+        by_week.setdefault(week_key, {})
+        by_week[week_key][item["id"]] = item
+
+    def week_anchor_dt(week_key: str) -> datetime:
+        start, _ = _week_start_end_dates(week_key)
+        # anchor resources to Monday 09:00 local
+        return datetime(start.year, start.month, start.day, 9, 0, 0, tzinfo=local_tz)
+
+    for manifest_path, manifest in manifests_loaded:
+        course = manifest.get("course") or {}
+        course_id = str(course.get("id", "") or "")
+        course_name = course.get("name") or manifest_path.parent.name
+        course_url = course.get("url") or ""
+
+        for item in (manifest.get("items") or []):
+            item_type = (item.get("item_type") or "").strip().lower()
+            title = item.get("title") or ""
+
+            is_graded = item_type in {"assignment", "quiz"}
+            if not is_graded:
+                continue
+
+            due_at = item.get("due_at")
+            if not due_at:
+                due_at = _infer_due_at_from_text_file(download_dir, item.get("file_path"))
+
+            scheduled_dt = None
+            if due_at:
+                dt = _parse_canvas_datetime(due_at)
+                if dt:
+                    scheduled_dt = dt.astimezone(local_tz)
+
+            week_key = _iso_week_key(scheduled_dt) if scheduled_dt else None
+            direct_url = _stable_canvas_url_for_item(
+                course_id=course_id,
+                item_type=item_type,
+                item_id=item.get("item_id"),
+                source_url=item.get("source_url"),
+            )
+
+            module_folder = _infer_module_folder_from_relative_path(item.get("file_path"))
+
+            base = {
+                "id": item.get("item_id"),
+                "kind": "assignment" if item_type == "assignment" else "quiz",
+                "title": title,
+                "course": {"id": course_id, "name": course_name, "url": course_url},
+                "direct_url": direct_url,
+                "source_url": item.get("source_url"),
+                "local_relative_path": item.get("file_path"),
+                "module": {
+                    "id": item.get("module_id"),
+                    "name": item.get("module_name"),
+                    "folder": module_folder,
+                    "unlock_at": item.get("module_unlock_at") or None,
+                },
+                "due_at": due_at,
+                "scheduled_by": "due_at" if scheduled_dt else None,
+                "links": item.get("links") or [],
+                "scheduled_at_local": scheduled_dt.isoformat() if scheduled_dt else None,
+                "scheduled_date_local": scheduled_dt.date().isoformat() if scheduled_dt else None,
+                "week": week_key,
+            }
+
+            # Build per-task "materials" so the UI can show everything needed *inside* the task card.
+            materials: list[dict] = []
+            zoom_links: list[dict] = []
+
+            # A) Links referenced directly from this assignment/quiz
+            for link in (base.get("links") or []):
+                url = (link.get("resolved_url") or link.get("url") or "").strip()
+                if not url:
+                    continue
+                if base.get("direct_url") and url == base["direct_url"]:
+                    continue
+
+                if is_zoom_related(url, link.get("title", ""), title):
+                    zoom_links.append(
+                        {
+                            "title": (link.get("text") or link.get("title") or "").strip(),
+                            "url": url,
+                            "source": "linked_from_task",
+                        }
+                    )
+
+                kind = _resource_kind_from_url(url, link.get("type", ""))
+                title_hint = (link.get("text") or link.get("title") or "").strip()
+
+                local_path = None
+                file_id = None
+                m = re.search(r"/files/(\d+)", url)
+                if m:
+                    file_id = m.group(1)
+                if file_id:
+                    file_item = file_items_by_file_id.get((course_id, file_id))
+                    if file_item:
+                        local_path = file_item.get("file_path")
+
+                mat = {
+                    "material_kind": kind,
+                    "title": title_hint or url,
+                    "url": url,
+                    "direct_url": (f"{CANVAS_URL}/courses/{course_id}/files/{file_id}" if file_id else url),
+                    "local_relative_path": local_path,
+                }
+                # If the linked file is a local video, treat it as video/recording.
+                if local_path and _is_video_file_relpath(local_path):
+                    mat["material_kind"] = "video"
+                    if _looks_like_recording(mat["title"], local_path) or "zoom" in (mat["title"] or "").lower():
+                        mat["material_kind"] = "recording"
+                if _looks_like_reading(mat["title"]):
+                    mat["material_kind"] = "reading"
+                    mat["resource_category"] = "reading"
+                    mat["reading"] = _extract_reading_spec(mat["title"])
+                materials.append(mat)
+
+            # B) Everything inside the same module folder (pages/files/videos/ppts/etc.)
+            if module_folder:
+                for mit in items_by_module_folder.get((course_id, module_folder), []):
+                    mit_type = (mit.get("item_type") or "").strip().lower()
+                    if mit_type in {"assignment", "quiz", "module"}:
+                        continue
+                    if mit_type not in {"page", "file", "external_url", "external_tool", "discussion"}:
+                        continue
+                    rid = str(mit.get("item_id") or "").strip()
+                    if not rid:
+                        continue
+
+                    direct2 = _stable_canvas_url_for_item(
+                        course_id=course_id,
+                        item_type=mit_type,
+                        item_id=rid,
+                        source_url=mit.get("source_url"),
+                    )
+                    local_rel = mit.get("file_path")
+                    mtitle = mit.get("title") or rid
+                    mat2 = {
+                        "material_kind": "module_item",
+                        "resource_type": mit_type,
+                        "title": mtitle,
+                        "direct_url": direct2,
+                        "source_url": mit.get("source_url"),
+                        "local_relative_path": local_rel,
+                        "links": mit.get("links") or [],
+                    }
+
+                    if is_zoom_related(direct2 or "", mtitle, title):
+                        zoom_links.append({"title": mtitle, "url": direct2, "source": "module_item"})
+
+                    # Promote obvious recordings / videos
+                    if mit_type == "file":
+                        if local_rel and _is_video_file_relpath(local_rel):
+                            mat2["material_kind"] = "video"
+                        if _looks_like_recording(mtitle, local_rel or "") or ("zoom" in (mtitle or "").lower()):
+                            mat2["material_kind"] = "recording"
+
+                    if _looks_like_reading(mtitle):
+                        mat2["material_kind"] = "reading"
+                        mat2["resource_category"] = "reading"
+                        mat2["reading"] = _extract_reading_spec(mtitle)
+
+                    materials.append(mat2)
+
+            base["materials"] = materials
+            base["zoom"] = zoom_links
+            base["priority_hint"] = _priority_hint(base["kind"], base.get("title") or "")
+
+            all_items.append(base)
+            add_to_week(week_key, base)
+
+            # Prep item
+            if scheduled_dt:
+                offset_days = 3 if item_type == "assignment" else 2
+                prep_dt = scheduled_dt - timedelta(days=offset_days)
+                prep_week = _iso_week_key(prep_dt)
+                actions = _summarize_prep_focus(materials, zoom_links)
+                actions_str = ", ".join(actions)
+                prep = {
+                    "id": f"prep::{base['id']}::-{offset_days}d",
+                    "kind": "prep",
+                    "title": f"Prep: {actions_str} for {base['kind']} – {title}",
+                    "course": {"id": course_id, "name": course_name, "url": course_url},
+                    "direct_url": direct_url,
+                    "source_url": base.get("source_url"),
+                    "local_relative_path": base.get("local_relative_path"),
+                    "module": base.get("module"),
+                    "due_at": None,
+                    "scheduled_by": "generated_prep",
+                    "generated_from": {"id": base["id"], "kind": base["kind"], "offset_days": -offset_days},
+                    "scheduled_at_local": prep_dt.isoformat(),
+                    "scheduled_date_local": prep_dt.date().isoformat(),
+                    "week": prep_week,
+                }
+                prep["materials"] = materials
+                prep["zoom"] = zoom_links
+                prep["priority_hint"] = _priority_hint(prep["kind"], prep.get("title") or "")
+                all_items.append(prep)
+                add_to_week(prep_week, prep)
+
+            # Resource items:
+            # 1) Links referenced directly from this assignment/quiz
+            if week_key:
+                anchor = week_anchor_dt(week_key)
+
+                for link in (base.get("links") or []):
+                    url = (link.get("resolved_url") or link.get("url") or "").strip()
+                    if not url:
+                        continue
+                    # Skip “self” references (Canvas Assignment/Quiz Page links we add to the item itself)
+                    if base.get("direct_url") and url == base["direct_url"]:
+                        continue
+                    if (link.get("type") or "").strip().lower() in {"canvas_assignment", "canvas_quiz"}:
+                        continue
+
+                    kind = _resource_kind_from_url(url, link.get("type", ""))
+                    title_hint = (link.get("text") or link.get("title") or "").strip()
+
+                    file_id = None
+                    m = re.search(r"/files/(\d+)", url)
+                    if m:
+                        file_id = m.group(1)
+                    resource_id = None
+                    if file_id:
+                        resource_id = f"resource:file:{course_id}:{file_id}"
+                    else:
+                        resource_id = f"resource:url:{hashlib.sha1(url.encode('utf-8')).hexdigest()[:12]}"
+
+                    local_path = None
+                    direct = url
+                    if file_id:
+                        direct = f"{CANVAS_URL}/courses/{course_id}/files/{file_id}"
+                        file_item = file_items_by_file_id.get((course_id, file_id))
+                        if file_item:
+                            local_path = file_item.get("file_path")
+
+                    res = {
+                        "id": resource_id,
+                        "kind": "resource",
+                        "resource_type": kind,
+                        "title": title_hint or url,
+                        "course": {"id": course_id, "name": course_name, "url": course_url},
+                        "direct_url": direct,
+                        "url": url,
+                        "local_relative_path": local_path,
+                        "scheduled_by": f"linked_from:{base['id']}",
+                        "scheduled_at_local": anchor.isoformat(),
+                        "scheduled_date_local": anchor.date().isoformat(),
+                        "week": week_key,
+                    }
+                    if _looks_like_reading(res["title"]):
+                        res["resource_category"] = "reading"
+                        res["reading"] = _extract_reading_spec(res["title"])
+                    all_items.append(res)
+                    add_to_week(week_key, res)
+
+                # 2) Everything inside the same module folder (pages/files/videos/ppts/etc.)
+                if module_folder:
+                    for mit in items_by_module_folder.get((course_id, module_folder), []):
+                        mit_type = (mit.get("item_type") or "").strip().lower()
+                        if mit_type in {"assignment", "quiz", "module"}:
+                            continue
+                        if mit_type not in {"page", "file", "external_url", "external_tool", "discussion"}:
+                            continue
+                        rid = str(mit.get("item_id") or "").strip()
+                        if not rid:
+                            continue
+                        res_id = f"resource:item:{course_id}:{rid}"
+                        direct2 = _stable_canvas_url_for_item(
+                            course_id=course_id,
+                            item_type=mit_type,
+                            item_id=rid,
+                            source_url=mit.get("source_url"),
+                        )
+                        r = {
+                            "id": res_id,
+                            "kind": "resource",
+                            "resource_type": mit_type,
+                            "title": mit.get("title") or rid,
+                            "course": {"id": course_id, "name": course_name, "url": course_url},
+                            "direct_url": direct2,
+                            "source_url": mit.get("source_url"),
+                            "local_relative_path": mit.get("file_path"),
+                            "module": {
+                                "id": mit.get("module_id"),
+                                "name": mit.get("module_name"),
+                                "folder": module_folder,
+                                "unlock_at": mit.get("module_unlock_at") or None,
+                            },
+                            "links": mit.get("links") or [],
+                            "scheduled_by": f"module_of:{base['id']}",
+                            "scheduled_at_local": anchor.isoformat(),
+                            "scheduled_date_local": anchor.date().isoformat(),
+                            "week": week_key,
+                        }
+                        if _looks_like_reading(r["title"]):
+                            r["resource_category"] = "reading"
+                            r["reading"] = _extract_reading_spec(r["title"])
+                        all_items.append(r)
+                        add_to_week(week_key, r)
+
+    # Write per-week folders (skip future weeks - only create folders for weeks that have started)
+    today = date.today()
+    index = {"generated_at": datetime.now().isoformat(), "weeks": []}
+    skipped_future = 0
+    for week_key in sorted(by_week.keys()):
+        start, end = _week_start_end_dates(week_key)
+        # Skip future weeks - only create folders for weeks that have started
+        if start > today:
+            skipped_future += 1
+            continue
+        week_folder = weekly_dir / f"{week_key}_{start.isoformat()}_to_{end.isoformat()}"
+        week_folder.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "week": {"key": week_key, "start_date": start.isoformat(), "end_date": end.isoformat()},
+            "generated_at": datetime.now().isoformat(),
+            "items": sorted(
+                list(by_week[week_key].values()),
+                key=lambda x: (
+                    x.get("scheduled_at_local") or "",
+                    x.get("course", {}).get("name", ""),
+                    x.get("kind", ""),
+                    x.get("resource_type", ""),
+                    x.get("title", ""),
+                ),
+            ),
+        }
+
+        # Create per-task bundle files (so the UI can open a self-contained task instead of deep links).
+        for it in payload["items"]:
+            if it.get("kind") not in {"assignment", "quiz", "prep"}:
+                continue
+            rel = _write_task_bundle_file(
+                download_dir=download_dir,
+                week_folder=week_folder,
+                task=it,
+                materials=it.get("materials") or [],
+                zoom_links=it.get("zoom") or [],
+            )
+            if rel:
+                it["task_bundle_relative_path"] = rel
+
+        with open(week_folder / "week.json", "w") as f:
+            json.dump(payload, f, indent=2)
+
+        index["weeks"].append({"key": week_key, "folder": week_folder.name, "count": len(payload["items"])})
+
+    if skipped_future > 0:
+        print(f"   ⏭️  Skipped {skipped_future} future week(s) (details not available yet)")
+
+    with open(weekly_dir / "_index.json", "w") as f:
+        json.dump(index, f, indent=2)
+
+    with open(weekly_dir / "_all_items.json", "w") as f:
+        json.dump({"generated_at": datetime.now().isoformat(), "items": all_items}, f, indent=2)
+
+    with open(weekly_dir / "_unscheduled.json", "w") as f:
+        json.dump({"generated_at": datetime.now().isoformat(), "items": unscheduled}, f, indent=2)
+
+
 async def main():
     import sys
     
     force_sync = "--force" in sys.argv or "-f" in sys.argv
+    bundle_weeks = "--bundle-weeks" in sys.argv
+    bundle_only = "--bundle-only" in sys.argv
     
     # Check for course filter
     course_filter = None
     for i, arg in enumerate(sys.argv):
         if arg in ["--course", "-c"] and i + 1 < len(sys.argv):
             course_filter = sys.argv[i + 1]
+
+    if bundle_only:
+        print(f"📂 Building weekly bundles from: {DOWNLOAD_DIR}")
+        bundle_weekly_exports(DOWNLOAD_DIR)
+        print(f"✅ Weekly bundles saved to: {DOWNLOAD_DIR / '_weekly'}")
+        return
     
-    syncer = CanvasSync(force_sync=force_sync, course_filter=course_filter)
+    syncer = CanvasSync(force_sync=force_sync, course_filter=course_filter, bundle_weeks=bundle_weeks)
     await syncer.run()
 
 

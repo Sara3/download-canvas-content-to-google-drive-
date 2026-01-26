@@ -2,3 +2,4 @@ httpx>=0.27.0
 python-dotenv>=1.0.0
 playwright>=1.40.0  # Only needed for login_refresh.py
 PyMuPDF>=1.23.0  # Optional: for PDF text extraction
+podcastfy>=0.4.3

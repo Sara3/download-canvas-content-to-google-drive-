@@ -20,6 +20,15 @@ Automatically syncs ALL content from your SRJC Canvas courses to Google Drive wi
 pip install -r requirements.txt
 ```
 
+#### Podcast generation prerequisites
+If you want to generate weekly podcasts using [Podcastfy](https://github.com/souzatharsis/podcastfy?tab=readme-ov-file), you also need `ffmpeg` installed (Podcastfy uses it for audio processing).
+
+On macOS:
+
+```bash
+brew install ffmpeg
+```
+
 ### 2. Set Up Session
 
 First, you need to log in to Canvas to create a session:
@@ -53,6 +62,30 @@ Or use the convenience script:
 ./sync.sh --force      # Full sync
 ./sync.sh --course "NUTR 10"  # Specific course
 ```
+
+### 🚀 Do Everything (Recommended)
+
+**One command to sync Canvas, download Zoom recordings, and generate podcasts:**
+
+```bash
+./sync_all.sh --course "KIN84"
+```
+
+This runs:
+1. ✅ Canvas content sync (with weekly bundles)
+2. ✅ Zoom recordings download (audio-only, converted to MP3)
+3. ✅ Weekly podcast generation (per-class + overall)
+
+**For all courses** (no Zoom):
+```bash
+./sync_all.sh
+```
+
+**Options:**
+- `--course "KIN84"` - Sync specific course + Zoom recordings
+- `--force` - Force re-download everything
+- `--no-zoom` - Skip Zoom recordings
+- `--no-podcast` - Skip podcast generation
 
 ## What Gets Downloaded
 
@@ -91,6 +124,70 @@ Google Drive/My Drive/Canvas/
 ### Direct Canvas URLs
 - **Assignments & Quizzes**: Each file includes the Canvas URL at the top for easy access
 - **PowerPoints**: Companion `.canvas_link.txt` or `.page_link.txt` files for accessing inline videos
+
+### Weekly Bundles (ALL classes, source-of-truth export)
+If you want a **single, weekly “batch”** you can feed into another client (which will then filter/sort), the sync can generate a `_weekly/` folder containing **one folder per ISO week** with a `week.json` inside.
+
+Generate weekly bundles while syncing:
+
+```bash
+python canvas_sync.py --bundle-weeks
+```
+
+Or generate bundles from existing `_manifest.json` files (no Canvas login required):
+
+```bash
+python canvas_sync.py --bundle-only
+```
+
+Output:
+
+```
+Google Drive/My Drive/Canvas/
+└── _weekly/
+    ├── 2026-W05_2026-01-26_to_2026-02-01/
+    │   └── week.json
+    ├── _index.json
+    ├── _all_items.json
+    └── _unscheduled.json
+```
+
+What gets included:
+- **Assignments & quizzes** (scheduled by `due_at`)
+- **Prep items** (auto-generated: assignments \(3 days before\), quizzes \(2 days before\))
+- **Prep resources with direct links** (auto-included as `kind: "resource"`):
+  - Links referenced inside assignment/quiz descriptions (articles, references, videos, PDFs, etc.)
+  - Content from the same module folder (pages/files/external links) when the graded item lives under `modules/<...>/`
+
+Each *task* item (`kind` in `assignment|quiz|prep`) also includes:
+- `materials`: structured list of everything referenced + in the same module folder (with `local_relative_path` when available)
+- `zoom`: best-effort list of Zoom-related links found in the task/module
+- `priority_hint`: simple `"high" | "medium" | "low"` hint (e.g. “participation” is de-emphasized vs graded work)
+- `task_bundle_relative_path`: a generated self-contained markdown file under `_weekly/<week>/tasks/...` that includes instructions/context + all materials (so UIs don’t have to rely on deep links)
+
+Each item includes:
+- `direct_url`: stable URL you can open in Canvas (or the external site)
+- `local_relative_path`: where the downloaded `.txt`/file lives in your Canvas drive folder (when available)
+
+If an item has no due/unlock date, it goes into `_unscheduled.json`.
+
+### Weekly podcasts (per class + overall)
+Once you have weekly bundles, you can generate:
+- **One podcast per class per week**
+- **One overall “this week” podcast**
+
+```bash
+python weekly_podcastfy.py --week latest --per-class --overall
+```
+
+Dry-run (see what sources will be used without calling the LLM/TTS):
+
+```bash
+python weekly_podcastfy.py --week latest --dry-run
+```
+
+Outputs are saved into the week folder under:
+`Canvas/_weekly/<week-folder>/podcasts/`
 
 ### Link Extraction
 - Extracts all links from pages, assignments, quizzes, and discussions
@@ -193,8 +290,41 @@ The script auto-detects Google Drive on Mac. If it doesn't work:
 
 - DRM-protected content (McGraw-Hill Connect, etc.)
 - Quiz questions from quizzes you haven't completed
-- External tool content requiring separate login
+- External tool content requiring separate login (but see Zoom note below)
 - Proctored exam content
+
+## Zoom LTI “Cloud Recordings” (KIN84 / TechConnect Zoom)
+
+Canvas external tools (like Zoom LTI) aren’t downloadable via the Canvas API, but this repo includes a **best-effort** downloader for the Zoom LTI portal so you can save **audio-only recordings** for commute listening.
+
+### 1) Make sure your Canvas session exists
+
+```bash
+python login_refresh.py
+```
+
+### 2) Set your Canvas Zoom tool URL
+
+In `.env`, set the course’s Zoom external tool page URL (from Canvas course navigation), e.g.:
+
+```bash
+CANVAS_ZOOM_TOOL_URL=https://canvas.santarosa.edu/courses/83136/external_tools/34904
+```
+
+### 3) Download recordings
+
+```bash
+python zoom_lti_sync.py --course "KIN84"
+```
+
+Downloads go to:
+`<DOWNLOAD_DIR>/<course>/zoom_recordings/`
+
+Optional: convert to MP3 (requires `ffmpeg`):
+
+```bash
+python zoom_lti_sync.py --course "KIN84" --convert-mp3
+```
 
 ## File Safety
 
